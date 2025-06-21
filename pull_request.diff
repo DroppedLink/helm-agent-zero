@@ -1,0 +1,906 @@
+diff --git a/docs/mcp_setup.md b/docs/mcp_setup.md
+index ee4e63a2d..bfc3be702 100644
+--- a/docs/mcp_setup.md
++++ b/docs/mcp_setup.md
+@@ -4,10 +4,11 @@ This guide explains how to configure and utilize external tool
+ providers through
+
+ ## What are MCP Servers?
+
+-MCP servers are external processes or services that expose a set of tools that
+Agent Zero can use. Agent Zero acts as an MCP *client*, consuming tools made ava
+ilable by these servers. The integration supports two main types of MCP servers:
++MCP servers are external processes or services that expose a set of tools that
+Agent Zero can use. Agent Zero acts as an MCP *client*, consuming tools made ava
+ilable by these servers. The integration supports three main types of MCP server
+s:
+
+ 1.  **Local Stdio Servers**: These are typically local executables that Agent Z
+ero communicates with via standard input/output (stdio).
+ 2.  **Remote SSE Servers**: These are servers, often accessible over a network,
+ that Agent Zero communicates with using Server-Sent Events (SSE), usually over
+HTTP/S.
++3.  **Remote Streaming HTTP Servers**: These are servers that use the streamabl
+e HTTP transport protocol for MCP communication, providing an alternative to SSE
+ for network-based MCP servers.
+
+ ## How Agent Zero Consumes MCP Tools
+
+@@ -65,6 +66,7 @@ Here are templates for configuring individual servers within t
+he `mcp_servers` J
+ {
+     "name": "My Local Tool Server",
+     "description": "Optional: A brief description of this server.",
++    "type": "stdio", // Optional: Explicitly specify server type. Can be "stdio
+", "sse", or streaming HTTP variants ("http-stream", "streaming-http", "streamab
+le-http", "http-streaming"). Auto-detected if omitted.
+     "command": "python", // The executable to run (e.g., python, /path/to/my_to
+ol_server)
+     "args": ["path/to/your/mcp_stdio_script.py", "--some-arg"], // List of argu
+ments for the command
+     "env": { // Optional: Environment variables for the command's process
+@@ -83,6 +85,7 @@ Here are templates for configuring individual servers within t
+he `mcp_servers` J
+ {
+     "name": "My Remote API Tools",
+     "description": "Optional: Description of the remote SSE server.",
++    "type": "sse", // Optional: Explicitly specify server type. Can be "stdio",
+ "sse", or streaming HTTP variants ("http-stream", "streaming-http", "streamable
+-http", "http-streaming"). Auto-detected if omitted.
+     "url": "https://api.example.com/mcp-sse-endpoint", // The full URL for the
+SSE endpoint of the MCP server.
+     "headers": { // Optional: Any HTTP headers required for the connection.
+         "Authorization": "Bearer YOUR_API_KEY_OR_TOKEN",
+@@ -94,6 +97,24 @@ Here are templates for configuring individual servers within
+the `mcp_servers` J
+ }
+ ```
+
++**3. Remote Streaming HTTP Server**
++
++```json
++{
++    "name": "My Streaming HTTP Tools",
++    "description": "Optional: Description of the remote streaming HTTP server."
+,
++    "type": "streaming-http", // Optional: Explicitly specify server type. Can
+be "stdio", "sse", or streaming HTTP variants ("http-stream", "streaming-http",
+"streamable-http", "http-streaming"). Auto-detected if omitted.
++    "url": "https://api.example.com/mcp-http-endpoint", // The full URL for the
+ streaming HTTP endpoint of the MCP server.
++    "headers": { // Optional: Any HTTP headers required for the connection.
++        "Authorization": "Bearer YOUR_API_KEY_OR_TOKEN",
++        "X-Custom-Header": "some_value"
++    },
++    "timeout": 5.0, // Optional: Connection timeout in seconds (default: 5.0).
++    "sse_read_timeout": 300.0, // Optional: Read timeout for the SSE and stream
+ing HTTP streams in seconds (default: 300.0, i.e., 5 minutes).
++    "disabled": false
++}
++```
++
+ **Example `mcp_servers` value in `tmp/settings.json`:**
+
+ ```json
+@@ -107,8 +128,9 @@ Here are templates for configuring individual servers within
+ the `mcp_servers` J
+ **Key Configuration Fields:**
+
+ *   `"name"`: A unique name for the server. This name will be used to prefix th
+e tools provided by this server (e.g., `my_server_name.tool_name`). The name is
+normalized internally (converted to lowercase, spaces and hyphens replaced with
+underscores).
++*   `"type"`: Optional explicit server type specification. Can be `"stdio"`, `"
+sse"`, or streaming HTTP variants (`"http-stream"`, `"streaming-http"`, `"stream
+able-http"`, `"http-streaming"`). If omitted, the type is auto-detected based on
+ the presence of `"command"` (stdio) or `"url"` (defaults to sse for backward co
+mpatibility).
+ *   `"disabled"`: A boolean (`true` or `false`). If `true`, Agent Zero will ign
+ore this server configuration.
+-*   `"url"`: **Required for Remote SSE Servers.** The endpoint URL.
++*   `"url"`: **Required for Remote SSE and Streaming HTTP Servers.** The endpoi
+nt URL.
+ *   `"command"`: **Required for Local Stdio Servers.** The executable command.
+ *   `"args"`: Optional list of arguments for local Stdio servers.
+ *   Other fields are specific to the server type and mostly optional with defau
+lts.
+@@ -121,4 +143,4 @@ Once configured, successfully installed (if applicable, e.g.
+, for `npx` based se
+ *   **Agent Interaction**: You can instruct the agent to use these tools. For e
+xample: "Agent, use the `sequential_thinking.run_chain` tool with the following
+input..." The agent's LLM will then formulate the appropriate JSON request.
+ *   **Execution Flow**: Agent Zero's `process_tools` method (with logic in `pyt
+hon/helpers/mcp_handler.py`) prioritizes looking up the tool name in the `MCPCon
+fig`. If found, the execution is delegated to the corresponding MCP server. If n
+ot found as an MCP tool, it then attempts to find a local/built-in tool with tha
+t name.
+
+-This setup provides a flexible way to extend Agent Zero's capabilities by integ
+rating with various external tool providers without modifying its core codebase.
+
+\ No newline at end of file
++This setup provides a flexible way to extend Agent Zero's capabilities by integ
+rating with various external tool providers without modifying its core codebase.
+diff --git a/python/helpers/mcp_handler.py b/python/helpers/mcp_handler.py
+index fbc241aef..6474ca69a 100644
+--- a/python/helpers/mcp_handler.py
++++ b/python/helpers/mcp_handler.py
+@@ -24,15 +24,12 @@
+ from python.helpers import errors
+ from python.helpers import settings
+
+-import os
+-
+-# print(f"DEBUG: Listing /opt/venv/lib/python3.11/site-packages/ before mcp imp
+ort: {os.listdir('/opt/venv/lib/python3.11/site-packages/')}") # This line cause
+d FileNotFoundError, **FOR CUDA CHANGE TO '3.12'**
+-
+ from mcp import ClientSession, StdioServerParameters
+ from mcp.client.stdio import stdio_client
+ from mcp.client.sse import sse_client
++from mcp.client.streamable_http import streamablehttp_client
+ from mcp.shared.message import SessionMessage
+-from mcp.types import CallToolResult, ListToolsResult, JSONRPCMessage
++from mcp.types import CallToolResult, ListToolsResult
+ from anyio.streams.memory import (
+     MemoryObjectReceiveStream,
+     MemoryObjectSendStream,
+@@ -40,7 +37,6 @@
+
+ from pydantic import BaseModel, Field, Discriminator, Tag, PrivateAttr
+ from python.helpers import dirty_json
+-from python.helpers.dirty_json import DirtyJson
+ from python.helpers.print_style import PrintStyle
+ from python.helpers.tool import Tool, Response
+
+@@ -55,6 +51,33 @@ def normalize_name(name: str) -> str:
+     return name
+
+
++def _determine_server_type(config_dict: dict) -> str:
++    """Determine the server type based on configuration, with backward compatib
+ility."""
++    # First check if type is explicitly specified
++    if "type" in config_dict:
++        server_type = config_dict["type"].lower()
++        if server_type in ["sse", "http-stream", "streaming-http", "streamable-
+http", "http-streaming"]:
++            return "MCPServerRemote"
++        elif server_type == "stdio":
++            return "MCPServerLocal"
++        # For future types, we could add more cases here
++        else:
++            # For unknown types, fall back to URL-based detection
++            # This allows for graceful handling of new types
++            pass
++
++    # Backward compatibility: if no type specified, use URL-based detection
++    if "url" in config_dict or "serverUrl" in config_dict:
++        return "MCPServerRemote"
++    else:
++        return "MCPServerLocal"
++
++
++def _is_streaming_http_type(server_type: str) -> bool:
++    """Check if the server type is a streaming HTTP variant."""
++    return server_type.lower() in ["http-stream", "streaming-http", "streamable
+-http", "http-streaming"]
++
++
+ def initialize_mcp(mcp_servers_config: str):
+     if not MCPConfig.get_instance().is_initialized():
+         try:
+@@ -67,11 +90,10 @@ def initialize_mcp(mcp_servers_config: str):
+                 content=f"Failed to update MCP settings: {e}",
+                 temp=False,
+             )
+-
++
+             PrintStyle(
+                 background_color="black", font_color="red", padding=True
+             ).print(f"Failed to update MCP settings: {e}")
+-
+
+
+ class MCPTool(Tool):
+@@ -145,9 +167,9 @@ async def after_execution(self, response: Response, **kwargs
+: Any):
+             content = self.agent.last_user_message.content
+             if isinstance(content, dict):
+                 # Attempt to get a 'message' field, otherwise stringify the dic
+t
+-                user_message_text = content.get(
++                user_message_text = str(content.get(
+                     "message", json.dumps(content, indent=2)
+-                )
++                ))
+             elif isinstance(content, str):
+                 user_message_text = content
+             else:
+@@ -164,27 +186,6 @@ async def after_execution(self, response: Response, **kwarg
+s: Any):
+                 user_message_text[:max_user_context_len] + "... (truncated)"
+             )
+
+-        # commented out for now, output should be unified between tools and MCP
+s
+-
+-        #         contextual_block = f"""
+-        # \n--- End of Results for MCP Tool: {self.name} ---
+-
+-        # **Original Tool Call Details:**
+-        # *   **Tool:** `{self.name}`
+-        # *   **Arguments Given:**
+-        #     ```json
+-        # {json.dumps(self.args, indent=2)}
+-        #     ```
+-
+-        # **Related User Request Context:**
+-        # {user_message_text}
+-
+-        # **Next Steps Reminder for {self.name}:**
+-        # If this action is part of an ongoing sequence, consider the next step
+ with this tool or another appropriate tool. If the sequence is complete or this
+ was a one-off action, analyze the final output and report to the user or procee
+d with the overall plan.
+-        # """
+-
+-        #         final_text_for_agent = raw_tool_response + contextual_block
+-
+         final_text_for_agent = raw_tool_response
+
+         self.agent.hist_add_tool_result(self.name, final_text_for_agent)
+@@ -210,6 +211,7 @@ async def after_execution(self, response: Response, **kwargs
+: Any):
+ class MCPServerRemote(BaseModel):
+     name: str = Field(default_factory=str)
+     description: Optional[str] = Field(default="Remote SSE Server")
++    type: str = Field(default="sse", description="Server connection type")
+     url: str = Field(default_factory=str)
+     headers: dict[str, Any] | None = Field(default_factory=dict[str, Any])
+     init_timeout: int = Field(default=0)
+@@ -256,6 +258,7 @@ def update(self, config: dict[str, Any]) -> "MCPServerRemote
+":
+                 if key in [
+                     "name",
+                     "description",
++                    "type",
+                     "url",
+                     "serverUrl",
+                     "headers",
+@@ -280,6 +283,7 @@ async def __on_update(self) -> "MCPServerRemote":
+ class MCPServerLocal(BaseModel):
+     name: str = Field(default_factory=str)
+     description: Optional[str] = Field(default="Local StdIO Server")
++    type: str = Field(default="stdio", description="Server connection type")
+     command: str = Field(default_factory=str)
+     args: list[str] = Field(default_factory=list)
+     env: dict[str, str] | None = Field(default_factory=dict[str, str])
+@@ -331,6 +335,7 @@ def update(self, config: dict[str, Any]) -> "MCPServerLocal"
+:
+                 if key in [
+                     "name",
+                     "description",
++                    "type",
+                     "command",
+                     "args",
+                     "env",
+@@ -356,7 +361,7 @@ async def __on_update(self) -> "MCPServerLocal":
+         Annotated[MCPServerRemote, Tag("MCPServerRemote")],
+         Annotated[MCPServerLocal, Tag("MCPServerLocal")],
+     ],
+-    Discriminator(lambda v: "MCPServerRemote" if "url" in v else "MCPServerLoca
+l"),
++    Discriminator(_determine_server_type),
+ ]
+
+
+@@ -370,9 +375,9 @@ class MCPConfig(BaseModel):
+     @classmethod
+     def get_instance(cls) -> "MCPConfig":
+         # with cls.__lock:
+-            if cls.__instance is None:
+-                cls.__instance = cls(servers_list=[])
+-            return cls.__instance
++        if cls.__instance is None:
++            cls.__instance = cls(servers_list=[])
++        return cls.__instance
+
+     @classmethod
+     def wait_for_lock(cls):
+@@ -660,7 +665,7 @@ def get_server_detail(self, server_name: str) -> dict[str, A
+ny]:
+                 if server.name == server_name:
+                     try:
+                         tools = server.get_tools()
+-                    except Exception as e:
++                    except Exception:
+                         tools = []
+                     return {
+                         "name": server.name,
+@@ -718,40 +723,9 @@ def get_tools_prompt(self, server_name: str = "") -> str:
+                         # f"#### Arguments:\n"
+                     )
+
+-                    tool_args = ""
+                     input_schema = (
+                         json.dumps(tool["input_schema"]) if tool["input_schema"
+] else ""
+                     )
+-                    # properties: dict[str, Any] = tool["input_schema"]["proper
+ties"]
+-                    # for key, value in properties.items():
+-                    #     optional = False
+-                    #     examples = ""
+-                    #     description = ""
+-                    #     type = ""
+-                    #     if "anyOf" in value:
+-                    #         for nested_value in value["anyOf"]:
+-                    #             if "type" in nested_value and nested_value["t
+ype"] != "null":
+-                    #                 optional = True
+-                    #                 value = nested_value
+-                    #                 break
+-                    #     tool_args += f"            \"{key}\": \"...\",\n"
+-                    #     if "examples" in value:
+-                    #         examples = f"(examples: {value['examples']})"
+-                    #     if "description" in value:
+-                    #         description = f": {value['description']}"
+-                    #     if "type" in value:
+-                    #         if optional:
+-                    #             type = f"{value['type']}, optional"
+-                    #         else:
+-                    #             type = f"{value['type']}"
+-                    #     else:
+-                    #         if optional:
+-                    #             type = "string, optional"
+-                    #         else:
+-                    #             type = "string"
+-                    #     prompt += (
+-                    #         f" * {key} ({type}){description} {examples}\n"
+-                    #     )
+
+                     prompt += f"#### Input schema for tool_args:\n{input_schema
+}\n"
+
+@@ -1047,6 +1021,11 @@ async def _create_stdio_transport(
+
+ class MCPClientRemote(MCPClientBase):
+
++    def __init__(self, server: Union[MCPServerLocal, MCPServerRemote]):
++        super().__init__(server)
++        self.session_id: Optional[str] = None  # Track session ID for streaming
+ HTTP clients
++        self.session_id_callback: Optional[Callable[[], Optional[str]]] = None
++
+     async def _create_stdio_transport(
+         self, current_exit_stack: AsyncExitStack
+     ) -> tuple[
+@@ -1056,12 +1035,43 @@ async def _create_stdio_transport(
+         """Connect to an MCP server, init client and save stdio/write streams""
+"
+         server: MCPServerRemote = cast(MCPServerRemote, self.server)
+         set = settings.get_settings()
+-        stdio_transport = await current_exit_stack.enter_async_context(
+-            sse_client(
+-                url=server.url,
+-                headers=server.headers,
+-                timeout=server.init_timeout or set["mcp_client_init_timeout"],
+-                sse_read_timeout=server.tool_timeout or set["mcp_client_tool_ti
+meout"],
++
++        # Use lower timeouts for faster failure detection
++        init_timeout = min(server.init_timeout or set["mcp_client_init_timeout"
+], 5)
++        tool_timeout = min(server.tool_timeout or set["mcp_client_tool_timeout"
+], 10)
++
++        # Check if this is a streaming HTTP type
++        if _is_streaming_http_type(server.type):
++            # Use streamable HTTP client
++            transport_result = await current_exit_stack.enter_async_context(
++                streamablehttp_client(
++                    url=server.url,
++                    headers=server.headers,
++                    timeout=timedelta(seconds=init_timeout),
++                    sse_read_timeout=timedelta(seconds=tool_timeout),
++                )
+             )
+-        )
+-        return stdio_transport
++            # streamablehttp_client returns (read_stream, write_stream, get_ses
+sion_id_callback)
++            read_stream, write_stream, get_session_id_callback = transport_resu
+lt
++
++            # Store session ID callback for potential future use
++            self.session_id_callback = get_session_id_callback
++
++            return read_stream, write_stream
++        else:
++            # Use traditional SSE client (default behavior)
++            stdio_transport = await current_exit_stack.enter_async_context(
++                sse_client(
++                    url=server.url,
++                    headers=server.headers,
++                    timeout=init_timeout,
++                    sse_read_timeout=tool_timeout,
++                )
++            )
++            return stdio_transport
++
++    def get_session_id(self) -> Optional[str]:
++        """Get the current session ID if available (for streaming HTTP clients)
+."""
++        if self.session_id_callback is not None:
++            return self.session_id_callback()
++        return None
+diff --git a/tests/mcp/stream_http_mcp_server.py b/tests/mcp/stream_http_mcp_ser
+ver.py
+new file mode 100644
+index 000000000..76ad6302b
+--- /dev/null
++++ b/tests/mcp/stream_http_mcp_server.py
+@@ -0,0 +1,223 @@
++#!/usr/bin/env python3
++"""
++Hello World MCP Server using FastMCP with Streamable HTTP Protocol
++
++This is a simple example demonstrating how to create an MCP server using
++the FastMCP framework with the streamable-http transport protocol.
++
++Features:
++- Hello world tool that greets users
++- Simple resource that provides server information
++- Basic prompt template for greeting
++- Runs using streamable-http transport for better scalability
++"""
++
++from fastmcp import FastMCP, Context
++import os
++from datetime import datetime
++
++
++# Create a FastMCP server instance
++mcp: FastMCP = FastMCP(
++    "Hello World Server 🚀",
++    dependencies=[]  # No special dependencies for this simple example
++)
++
++
++# ========== TOOLS ==========
++
++@mcp.tool()
++def hello_world(name: str = "World") -> str:
++    """Say hello to someone with a personalized greeting.
++
++    Args:
++        name: The name of the person to greet (defaults to "World")
++
++    Returns:
++        A friendly greeting message
++    """
++    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
++    return f"Hello, {name}! 👋 Welcome to the FastMCP Hello World Server. Curren
+t time: {current_time}"
++
++
++@mcp.tool()
++def add_numbers(a: float, b: float) -> float:
++    """Add two numbers together.
++
++    Args:
++        a: First number
++        b: Second number
++
++    Returns:
++        The sum of the two numbers
++    """
++    result = a + b
++    return result
++
++
++@mcp.tool()
++async def get_server_status(ctx: Context) -> str:
++    """Get the current server status and information.
++
++    Returns:
++        Server status information including uptime and capabilities
++    """
++    # Log that someone is checking server status
++    await ctx.info("Server status requested")
++
++    # Get basic server info
++    server_info = {
++        "status": "running",
++        "protocol": "MCP (Model Context Protocol)",
++        "transport": "streamable-http",
++        "framework": "FastMCP 2.0",
++        "capabilities": ["tools", "resources", "prompts"],
++        "timestamp": datetime.now().isoformat()
++    }
++
++    return f"""
++🟢 Server Status: {server_info['status'].upper()}
++
++📊 Server Information:
++• Protocol: {server_info['protocol']}
++• Transport: {server_info['transport']}
++• Framework: {server_info['framework']}
++• Capabilities: {', '.join(server_info['capabilities'])}
++• Last checked: {server_info['timestamp']}
++
++✅ All systems operational!
++"""
++
++
++# ========== RESOURCES ==========
++
++@mcp.resource("info://server")
++def get_server_info() -> str:
++    """Static resource providing information about this MCP server."""
++    return """
++🚀 Hello World MCP Server
++
++This is a demonstration MCP server built with FastMCP, showcasing the
++streamable-http transport protocol.
++
++Available capabilities:
++• Tools: Interactive functions the LLM can call
++• Resources: Data sources for context
++• Prompts: Reusable message templates
++
++Built with FastMCP 2.0 for production-ready MCP applications.
++"""
++
++
++@mcp.resource("greeting://{user_name}")
++def get_personal_greeting(user_name: str) -> str:
++    """Dynamic resource template that provides personalized greetings.
++
++    Args:
++        user_name: The name of the user to create a greeting for
++
++    Returns:
++        A personalized greeting message
++    """
++    greetings = [
++        f"Welcome, {user_name}! 🎉",
++        f"Hello there, {user_name}! Great to see you! 👋",
++        f"Greetings, {user_name}! Hope you're having a wonderful day! ☀️"
++    ]
++
++    # Select greeting based on name length (simple example)
++    greeting_index = len(user_name) % len(greetings)
++    return greetings[greeting_index]
++
++
++# ========== PROMPTS ==========
++
++@mcp.prompt()
++def introduction_prompt(user_name: str = "friend") -> str:
++    """Generate a friendly introduction prompt.
++
++    Args:
++        user_name: Name of the person to introduce to
++
++    Returns:
++        A prompt for introducing the MCP server capabilities
++    """
++    return f"""
++Hello {user_name}! 👋
++
++I'm your Hello World MCP Server, here to demonstrate the power of the Model Con
+text Protocol with FastMCP!
++
++Here's what I can help you with:
++
++🔧 **Tools I can execute:**
++• hello_world - Give you personalized greetings
++• add_numbers - Perform simple math operations
++• get_server_status - Check my current status
++
++📚 **Resources I can provide:**
++• Server information and documentation
++• Personalized greeting messages
++
++💡 **How to use me:**
++Try asking me to say hello, add some numbers, or check my status!
++
++What would you like to do first?
++"""
++
++
++@mcp.prompt()
++def math_prompt(operation: str = "addition") -> str:
++    """Create a prompt for helping with math operations.
++
++    Args:
++        operation: The type of math operation to help with
++
++    Returns:
++        A simple prompt for math assistance
++    """
++    return (f"I need help with {operation}. I'd be happy to help you with {oper
+ation}! "
++            f"I can add numbers together using my add_numbers tool. "
++            f"Just tell me which numbers you'd like me to work with.")
++
++
++# ========== SERVER LIFECYCLE ==========
++
++def main():
++    """Main function to run the MCP server."""
++    print("🚀 Starting Hello World MCP Server with Streamable HTTP...")
++    print("📡 Transport: streamable-http")
++    print("🌐 Framework: FastMCP 2.0")
++    print("🔗 Protocol: Model Context Protocol (MCP)")
++    print()
++
++    # Get configuration from environment or use defaults
++    host = os.getenv("MCP_HOST", "0.0.0.0")
++    port = int(os.getenv("MCP_PORT", "8000"))
++    path = os.getenv("MCP_PATH", "/mcp")
++
++    print(f"🏠 Host: {host}")
++    print(f"🚪 Port: {port}")
++    print(f"🛤️  Path: {path}")
++    print(f"📍 Full URL: http://{host}:{port}{path}")
++    print()
++    print("✅ Server is ready to accept MCP connections!")
++    print("💡 Use this server with MCP clients that support streamable-http tran
+sport")
++    print()
++
++    # Run the server with streamable-http transport
++    try:
++        mcp.run(
++            transport="streamable-http",
++            host=host,
++            port=port,
++            path=path
++        )
++    except KeyboardInterrupt:
++        print("\n👋 Server shutting down gracefully...")
++    except Exception as e:
++        print(f"❌ Server error: {e}")
++        raise
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/mcp/stream_http_mcp_server_README.md b/tests/mcp/stream_http_
+mcp_server_README.md
+new file mode 100644
+index 000000000..dc8a9eec4
+--- /dev/null
++++ b/tests/mcp/stream_http_mcp_server_README.md
+@@ -0,0 +1,208 @@
++# FastMCP Hello World Server with Streamable HTTP
++
++A comprehensive hello world example demonstrating how to build an MCP (Model Co
+ntext Protocol) server using the FastMCP framework with streamable-http transpor
+t.
++
++## 🚀 Features
++
++This server demonstrates all three core MCP primitives:
++
++### 🔧 Tools (LLM-callable functions)
++- **hello_world** - Personalized greetings with timestamps
++- **add_numbers** - Simple math operations
++- **get_server_status** - Server status and information with context logging
++
++### 📚 Resources (Data sources)
++- **info://server** - Static server information
++- **greeting://{user_name}** - Dynamic personalized greetings template
++
++### 💡 Prompts (Reusable templates)
++- **introduction_prompt** - Server capability introduction
++- **math_prompt** - Math assistance template
++
++## 📋 Prerequisites
++
++- Python 3.10+
++- pip or uv package manager
++
++## 🛠️ Installation
++
++### Option 1: Using pip
++```bash
++# Install dependencies
++pip install -r stream_http_mcp_server_requirements.txt
++
++# Or install FastMCP directly
++pip install fastmcp
++```
++
++### Option 2: Using uv (recommended)
++```bash
++# Install FastMCP with uv
++uv pip install fastmcp
++```
++
++## ▶️ Running the Server
++
++### Basic Usage
++```bash
++# Run with default settings (localhost:8000/mcp)
++python stream_http_mcp_server.py
++```
++
++### Custom Configuration via Environment Variables
++```bash
++# Set custom host, port, and path
++export MCP_HOST=0.0.0.0
++export MCP_PORT=3000
++export MCP_PATH=/hello-mcp
++
++python stream_http_mcp_server.py
++```
++
++### Expected Output
++```
++🚀 Starting Hello World MCP Server with Streamable HTTP...
++📡 Transport: streamable-http
++🌐 Framework: FastMCP 2.0
++🔗 Protocol: Model Context Protocol (MCP)
++
++🏠 Host: 127.0.0.1
++🚪 Port: 8000
++🛤️  Path: /mcp
++📍 Full URL: http://127.0.0.1:8000/mcp
++
++✅ Server is ready to accept MCP connections!
++💡 Use this server with MCP clients that support streamable-http transport
++```
++
++## 🧪 Testing the Server
++
++### Method 1: Using MCP Inspector (Recommended)
++
++1. **Install MCP Inspector**:
++   ```bash
++   npm install -g @modelcontextprotocol/inspector
++   ```
++
++2. **Run the Inspector**:
++   ```bash
++   npx @modelcontextprotocol/inspector
++   ```
++
++3. **Connect to the Server**:
++   - Choose "Streamable HTTP" transport
++   - Enter URL: `http://localhost:8000/mcp`
++   - Click "Connect"
++
++4. **Test Tools**:
++   - Go to the "Tools" tab
++   - Try `hello_world` with `{"name": "Alice"}`
++   - Try `add_numbers` with `{"a": 5, "b": 3}`
++   - Try `get_server_status` (no parameters needed)
++
++5. **Test Resources**:
++   - Go to "Resources" tab
++   - View `info://server`
++   - Try `greeting://YourName`
++
++6. **Test Prompts**:
++   - Go to "Prompts" tab
++   - Try `introduction_prompt` with `{"user_name": "Developer"}`
++   - Try `math_prompt` with `{"operation": "multiplication"}`
++
++### Method 2: Agent Zero Integration
++
++Configure Agent Zero to use this server by adding to your MCP servers configura
+tion:
++
++```json
++[
++  {
++    "name": "hello_world_server",
++    "type": "streamable-http",
++    "url": "http://localhost:8000/mcp",
++    "description": "Hello World FastMCP Server with streamable HTTP"
++  }
++]
++```
++
++### Method 3: Custom MCP Client
++
++Example using the MCP Python SDK:
++
++```python
++from mcp.client.streamable_http import streamablehttp_client
++from mcp import ClientSession
++
++async def test_server():
++    async with streamablehttp_client("http://localhost:8000/mcp") as (read, wri
+te, get_session_id):
++        async with ClientSession(read, write) as session:
++            await session.initialize()
++
++            # Test tool
++            result = await session.call_tool("hello_world", {"name": "Test"})
++            print(f"Tool result: {result}")
++
++            # Test resource
++            resource = await session.read_resource("info://server")
++            print(f"Resource: {resource}")
++
++# Run with: asyncio.run(test_server())
++```
++
++## 🔧 Configuration Options
++
++### Environment Variables
++- `MCP_HOST` - Server host (default: 127.0.0.1)
++- `MCP_PORT` - Server port (default: 8000)
++- `MCP_PATH` - Server path (default: /mcp)
++
++### Server Capabilities
++This server supports all MCP capabilities:
++- ✅ Tools (with async support and context logging)
++- ✅ Resources (static and dynamic templates)
++- ✅ Prompts (string and message-based)
++- ✅ Streamable HTTP transport
++- ✅ Session management
++
++## 🎯 Key Concepts Demonstrated
++
++1. **FastMCP Framework**: Modern, production-ready MCP server development
++2. **Streamable HTTP Transport**: Scalable transport for web deployments
++3. **Type Safety**: Full Python type hints and docstrings
++4. **Async Support**: Proper async/await patterns with context
++5. **Dynamic Resources**: Template-based resources with parameters
++6. **Context Logging**: Using MCP context for client communication
++7. **Error Handling**: Graceful startup and shutdown
++
++## 📚 Next Steps
++
++- **Scale Up**: Use FastMCP's server composition to mount multiple apps
++- **Add Auth**: Implement OAuth authentication for production
++- **Deploy**: Use Docker or cloud platforms for production deployment
++- **Integrate**: Connect with Claude Desktop, Agent Zero, or custom clients
++- **Extend**: Add more sophisticated tools, resources, and prompts
++
++## 🐛 Troubleshooting
++
++### Server Won't Start
++- Check if port 8000 is available: `lsof -i :8000`
++- Try a different port: `MCP_PORT=8001 python stream_http_mcp_server.py`
++
++### Connection Issues
++- Verify the URL in your client matches the server output
++- Check firewall settings for the port
++- Ensure you're using "streamable-http" transport type
++
++### Import Errors
++- Install FastMCP: `pip install fastmcp`
++- Check Python version: `python --version` (requires 3.10+)
++
++## 📖 Documentation Links
++
++- [FastMCP Documentation](https://gofastmcp.com/)
++- [MCP Specification](https://spec.modelcontextprotocol.io/)
++- [Agent Zero MCP Integration](../../docs/mcp_setup.md)
++
++---
++
++Built with ❤️ using FastMCP 2.0 and the Model Context Protocol
+diff --git a/tests/mcp/stream_http_mcp_server_requirements.txt b/tests/mcp/strea
+m_http_mcp_server_requirements.txt
+new file mode 100644
+index 000000000..348d98865
+--- /dev/null
++++ b/tests/mcp/stream_http_mcp_server_requirements.txt
+@@ -0,0 +1,9 @@
++# FastMCP Hello World Server Requirements
++# Install with: pip install -r stream_http_mcp_server_requirements.txt
++
++# FastMCP framework for building MCP servers
++fastmcp>=2.8.0
++
++# Optional: Additional dependencies that might be useful
++# uvicorn>=0.18.0  # ASGI server (may be included with FastMCP)
++# httpx>=0.24.0    # HTTP client (may be included with FastMCP)
